@@ -4,3 +4,4 @@ numpy
 plotly
 openpyxl
 scikit-learn
+streamlit-plotly-events

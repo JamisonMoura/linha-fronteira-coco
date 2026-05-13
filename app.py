@@ -1,4 +1,5 @@
 import io
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,46 @@ from streamlit_plotly_events import plotly_events
 st.set_page_config(page_title="Linha de Fronteira", layout="wide")
 
 st.title("Linha de Fronteira — Clique nos Pontos")
-st.markdown("Suba sua planilha, escolha o nutriente e clique nos pontos que deseja usar.")
+st.markdown("Suba a planilha, escolha o nutriente e clique diretamente nos pontos.")
+
+
+# ============================================================
+# FUNÇÕES
+# ============================================================
+
+def converter_numero_br(serie):
+    """
+    Converte números vindos do Excel com vírgula decimal, ponto de milhar,
+    espaço, %, texto misturado etc.
+    """
+    s = serie.copy()
+
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    s = (
+        s.astype(str)
+        .str.strip()
+        .str.replace("\u00a0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace("%", "", regex=False)
+    )
+
+    # Se tiver ponto e vírgula, assume padrão brasileiro: 1.234,56
+    mask_br = s.str.contains(r"\.", regex=True) & s.str.contains(",", regex=False)
+    s.loc[mask_br] = (
+        s.loc[mask_br]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+    # Se tiver só vírgula, troca vírgula por ponto
+    s.loc[~mask_br] = s.loc[~mask_br].str.replace(",", ".", regex=False)
+
+    # Remove qualquer coisa que não seja número, sinal ou ponto
+    s = s.str.replace(r"[^0-9\.\-]", "", regex=True)
+
+    return pd.to_numeric(s, errors="coerce")
 
 
 def ajustar_quadratico(df, x_col, y_col):
@@ -82,6 +122,10 @@ def alternar_id(lista, id_clicado):
     return lista
 
 
+# ============================================================
+# ESTADO
+# ============================================================
+
 if "outliers_por_nutriente" not in st.session_state:
     st.session_state["outliers_por_nutriente"] = {}
 
@@ -94,6 +138,10 @@ if "pontos_salvos" not in st.session_state:
 if "equacoes_salvas" not in st.session_state:
     st.session_state["equacoes_salvas"] = []
 
+
+# ============================================================
+# UPLOAD
+# ============================================================
 
 arquivo = st.file_uploader("Suba sua planilha Excel", type=["xlsx"])
 
@@ -118,7 +166,8 @@ with col1:
         index=colunas.index("PROD") if "PROD" in colunas else 0
     )
 
-df[col_prod] = pd.to_numeric(df[col_prod], errors="coerce")
+# Converter produtividade corretamente
+df[col_prod] = converter_numero_br(df[col_prod])
 
 with col2:
     modo_rel = st.radio(
@@ -135,22 +184,48 @@ with col3:
     else:
         prod_ref = float(df[col_prod].max())
 
+if np.isnan(prod_ref) or prod_ref == 0:
+    st.error("A coluna de produtividade não foi lida corretamente. Verifique se a coluna escolhida é a correta.")
+    st.stop()
+
 df["PROD_REL"] = (df[col_prod] / prod_ref) * 100
 
 st.info(f"Produtividade usada como 100%: {prod_ref:.2f}")
+
+
+# ============================================================
+# NUTRIENTES
+# ============================================================
 
 possiveis_nutrientes = [
     c for c in colunas
     if c not in [col_prod, "PROD_REL"]
 ]
 
+# ============================================================
+# DETECTAR AUTOMATICAMENTE COLUNAS NUMÉRICAS
+# ============================================================
+
+colunas_numericas_detectadas = []
+
+for c in possiveis_nutrientes:
+
+    temp = converter_numero_br(df[c])
+
+    n_validos = temp.notna().sum()
+
+    # Se tiver pelo menos 3 valores numéricos válidos,
+    # considera como variável quantitativa
+    if n_validos >= 3:
+        colunas_numericas_detectadas.append(c)
+
+st.write("Colunas numéricas detectadas automaticamente:")
+st.write(colunas_numericas_detectadas)
+
 nutrientes = st.multiselect(
-    "Selecione os nutrientes",
-    possiveis_nutrientes,
-    default=[
-        c for c in ["N", "P", "K", "Ca", "Mg", "S", "B", "Cu", "Mn", "Fe", "Zn"]
-        if c in possiveis_nutrientes
-    ]
+    "Selecione os nutrientes/variáveis",
+    colunas_numericas_detectadas,
+    default=colunas_numericas_detectadas[:5]
 )
 
 if len(nutrientes) == 0:
@@ -159,13 +234,34 @@ if len(nutrientes) == 0:
 
 nutriente = st.selectbox("Nutriente atual", nutrientes)
 
-df[nutriente] = pd.to_numeric(df[nutriente], errors="coerce")
+df[nutriente] = converter_numero_br(df[nutriente])
 
-dados = df[[nutriente, col_prod, "PROD_REL"]].dropna().copy()
+dados = df[[nutriente, col_prod, "PROD_REL"]].copy()
+linhas_antes = len(dados)
+
+dados = dados.dropna(subset=[nutriente, col_prod, "PROD_REL"]).copy()
+linhas_depois = len(dados)
+
+if linhas_depois == 0:
+    st.error(
+        f"A base ficou vazia para o nutriente {nutriente}. "
+        "Isso indica que essa coluna não foi convertida para número."
+    )
+    st.write("Diagnóstico:")
+    st.write(df[[nutriente, col_prod, "PROD_REL"]].head(20))
+    st.write(df[[nutriente, col_prod, "PROD_REL"]].dtypes)
+    st.stop()
+
 dados = dados.reset_index(drop=False)
 dados = dados.rename(columns={"index": "indice_original"})
 dados["id_ponto"] = dados.index.astype(int)
 
+st.caption(f"Linhas antes do filtro: {linhas_antes} | Linhas válidas para o gráfico: {linhas_depois}")
+
+
+# ============================================================
+# ESTADO POR NUTRIENTE
+# ============================================================
 
 if nutriente not in st.session_state["outliers_por_nutriente"]:
     st.session_state["outliers_por_nutriente"][nutriente] = []
@@ -176,6 +272,10 @@ if nutriente not in st.session_state["fronteira_por_nutriente"]:
 ids_outliers = st.session_state["outliers_por_nutriente"][nutriente]
 ids_fronteira = st.session_state["fronteira_por_nutriente"][nutriente]
 
+
+# ============================================================
+# BOTÕES
+# ============================================================
 
 colb1, colb2, colb3 = st.columns(3)
 
@@ -203,15 +303,8 @@ with colb3:
 st.subheader("1. Clique nos pontos que deseja remover como outliers visuais")
 st.write("Clique uma vez para remover. Clique novamente para desfazer.")
 
-cores_out = [
-    "red" if int(i) in ids_outliers else "gray"
-    for i in dados["id_ponto"]
-]
-
-tamanhos_out = [
-    14 if int(i) in ids_outliers else 8
-    for i in dados["id_ponto"]
-]
+cores_out = ["red" if int(i) in ids_outliers else "gray" for i in dados["id_ponto"]]
+tamanhos_out = [14 if int(i) in ids_outliers else 8 for i in dados["id_ponto"]]
 
 fig_out = go.Figure()
 
@@ -223,7 +316,7 @@ fig_out.add_trace(
         marker=dict(
             size=tamanhos_out,
             color=cores_out,
-            opacity=0.80,
+            opacity=0.85,
             line=dict(width=1, color="black")
         ),
         text=[
@@ -266,7 +359,6 @@ if id_out is not None:
         st.session_state["fronteira_por_nutriente"][nutriente].remove(id_out)
 
     st.rerun()
-
 
 ids_outliers = st.session_state["outliers_por_nutriente"][nutriente]
 
@@ -311,7 +403,7 @@ fig_front.add_trace(
         marker=dict(
             size=tamanhos_front,
             color=cores_front,
-            opacity=0.88,
+            opacity=0.90,
             line=dict(width=1, color="black")
         ),
         text=[
@@ -354,7 +446,6 @@ if id_front is not None:
         id_front
     )
     st.rerun()
-
 
 ids_fronteira = st.session_state["fronteira_por_nutriente"][nutriente]
 
